@@ -1,0 +1,54 @@
+From e20415181a215c65f9f888abce578b1c7d54201f Mon Sep 17 00:00:00 2001
+From: Takayuki 'January June' Suwa <jjsuwa_sys3175@yahoo.co.jp>
+Date: Sun, 30 May 2021 23:09:33 +0900
+Subject: [PATCH 05/19] xtensa: Fix instruction counting regarding block move
+ expansion
+
+This patch makes counting the number of instructions of the remainder
+(modulo 4) part more accurate.
+
+gcc/ChangeLog:
+
+	* gcc/config/xtensa/xtensa.c (xtensa_expand_block_move):
+	Make instruction counting more accurate, and simplify emitting insns.
+---
+ gcc/config/xtensa/xtensa.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/gcc/config/xtensa/xtensa.c b/gcc/config/xtensa/xtensa.c
+index 2e92ee06a..d3405beb6 100644
+--- a/gcc/config/xtensa/xtensa.c
++++ b/gcc/config/xtensa/xtensa.c
+@@ -1303,7 +1303,7 @@ xtensa_expand_block_move (rtx *operands)
+   move_ratio = 4;
+   if (optimize > 2)
+     move_ratio = LARGEST_MOVE_RATIO;
+-  num_pieces = (bytes / align) + (bytes % align); /* Close enough anyway.  */
++  num_pieces = (bytes / align) + ((bytes % align + 1) / 2);
+   if (num_pieces > move_ratio)
+     return 0;
+ 
+@@ -1340,7 +1340,7 @@ xtensa_expand_block_move (rtx *operands)
+ 	  temp[next] = gen_reg_rtx (mode[next]);
+ 
+ 	  x = adjust_address (src_mem, mode[next], offset_ld);
+-	  emit_insn (gen_rtx_SET (temp[next], x));
++	  emit_move_insn (temp[next], x);
+ 
+ 	  offset_ld += next_amount;
+ 	  bytes -= next_amount;
+@@ -1350,9 +1350,9 @@ xtensa_expand_block_move (rtx *operands)
+       if (active[phase])
+ 	{
+ 	  active[phase] = false;
+-	  
++
+ 	  x = adjust_address (dst_mem, mode[phase], offset_st);
+-	  emit_insn (gen_rtx_SET (x, temp[phase]));
++	  emit_move_insn (x, temp[phase]);
+ 
+ 	  offset_st += amount[phase];
+ 	}
+-- 
+2.20.1
+
