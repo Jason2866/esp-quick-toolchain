@@ -1,0 +1,300 @@
+From 58ec3604f7efb75a5172391ade828467ed4ddb81 Mon Sep 17 00:00:00 2001
+From: Takayuki 'January June' Suwa <jjsuwa_sys3175@yahoo.co.jp>
+Date: Mon, 24 Jan 2022 10:57:05 +0900
+Subject: [PATCH 16/19] xtensa: Add support for sibling call optimization
+
+This patch introduces support for sibling call optimization, when the Windowed
+Register Option is NOT configured.
+
+gcc/ChangeLog:
+
+	* gcc/config/xtensa/xtensa-protos.h (xtensa_emit_sibcall):
+	New prototype.
+	(xtensa_expand_epilogue): Add new argument that specifies whether
+	or not sibling call.
+	* gcc/config/xtensa/xtensa.c (TARGET_FUNCTION_OK_FOR_SIBCALL):
+	New macro definition.
+	(xtensa_emit_sibcall, xtensa_function_ok_for_sibcall):
+	New functions.
+	(xtensa_expand_epilogue): Add new argument sibcall_p and use it
+	for sibling call handling.
+	* gcc/config/xtensa/xtensa.md (call_internal, call_value_internal):
+	Add the condition in order to be disabled if sibling call.
+	(sibcall, sibcall_value, sibcall_epilogue): New expansions.
+	(sibcall_internal, sibcall_value_internal): New insn-and-splits.
+
+gcc/testsuite/ChangeLog:
+
+	* gcc.target/xtensa/sibcalls.c: New.
+---
+ gcc/config/xtensa/xtensa-protos.h          |  3 +-
+ gcc/config/xtensa/xtensa.c                 | 48 ++++++++++++-
+ gcc/config/xtensa/xtensa.md                | 79 ++++++++++++++++++++--
+ gcc/testsuite/gcc.target/xtensa/sibcalls.c | 15 ++++
+ 4 files changed, 136 insertions(+), 9 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/xtensa/sibcalls.c
+
+diff --git a/gcc/config/xtensa/xtensa-protos.h b/gcc/config/xtensa/xtensa-protos.h
+index ce32f1fb3..1c1d03199 100644
+--- a/gcc/config/xtensa/xtensa-protos.h
++++ b/gcc/config/xtensa/xtensa-protos.h
+@@ -54,6 +54,7 @@ extern char *xtensa_emit_branch (bool, rtx *);
+ extern char *xtensa_emit_movcc (bool, bool, bool, rtx *);
+ extern void xtensa_prepare_expand_call (int, rtx *);
+ extern char *xtensa_emit_call (int, rtx *);
++extern char *xtensa_emit_sibcall (int, rtx *);
+ extern bool xtensa_split_longcalls_p (rtx);
+ extern void xtensa_prepare_split_longcalls (int, rtx *);
+ extern bool xtensa_peep2_longcalls_p (rtx *);
+@@ -76,7 +77,7 @@ extern int xtensa_dbx_register_number (int);
+ extern long compute_frame_size (poly_int64);
+ extern bool xtensa_use_return_instruction_p (void);
+ extern void xtensa_expand_prologue (void);
+-extern void xtensa_expand_epilogue (void);
++extern void xtensa_expand_epilogue (bool);
+ extern void order_regs_for_local_alloc (void);
+ extern enum reg_class xtensa_regno_to_class (int regno);
+ extern HOST_WIDE_INT xtensa_initial_elimination_offset (int from, int to);
+diff --git a/gcc/config/xtensa/xtensa.c b/gcc/config/xtensa/xtensa.c
+index 93cd52a2d..4a0758395 100644
+--- a/gcc/config/xtensa/xtensa.c
++++ b/gcc/config/xtensa/xtensa.c
+@@ -187,6 +187,7 @@ static bool xtensa_modes_tieable_p (machine_mode, machine_mode);
+ static HOST_WIDE_INT xtensa_constant_alignment (const_tree, HOST_WIDE_INT);
+ static HOST_WIDE_INT xtensa_starting_frame_offset (void);
+ static unsigned HOST_WIDE_INT xtensa_asan_shadow_offset (void);
++static bool xtensa_function_ok_for_sibcall (tree, tree);
+ 
+ 
+ 
+@@ -337,6 +338,9 @@ static unsigned HOST_WIDE_INT xtensa_asan_shadow_offset (void);
+ #undef TARGET_HAVE_SPECULATION_SAFE_VALUE
+ #define TARGET_HAVE_SPECULATION_SAFE_VALUE speculation_safe_value_not_needed
+ 
++#undef TARGET_FUNCTION_OK_FOR_SIBCALL
++#define TARGET_FUNCTION_OK_FOR_SIBCALL xtensa_function_ok_for_sibcall
++
+ struct gcc_target targetm = TARGET_INITIALIZER;
+ 
+ 
+@@ -2151,6 +2155,24 @@ xtensa_emit_call (int callop, rtx *operands)
+ }
+ 
+ 
++char *
++xtensa_emit_sibcall (int callop, rtx *operands)
++{
++  static char result[64];
++  rtx tgt = operands[callop];
++
++  if (GET_CODE (tgt) == CONST_INT)
++    sprintf (result, "j.l\t" HOST_WIDE_INT_PRINT_HEX ", a9",
++	     INTVAL (tgt));
++  else if (register_operand (tgt, VOIDmode))
++    sprintf (result, "jx\t%%%d", callop);
++  else
++    sprintf (result, "j.l\t%%%d, a9", callop);
++
++  return result;
++}
++
++
+ bool
+ xtensa_split_longcalls_p (rtx callee)
+ {
+@@ -3353,7 +3375,7 @@ xtensa_expand_prologue (void)
+ }
+ 
+ void
+-xtensa_expand_epilogue (void)
++xtensa_expand_epilogue (bool sibcall_p)
+ {
+   if (!TARGET_WINDOWED_ABI)
+     {
+@@ -3387,10 +3409,13 @@ xtensa_expand_epilogue (void)
+ 	  if (xtensa_call_save_reg(regno))
+ 	    {
+ 	      rtx x = gen_rtx_PLUS (Pmode, stack_pointer_rtx, GEN_INT (offset));
++	      rtx reg;
+ 
+ 	      offset -= UNITS_PER_WORD;
+-	      emit_move_insn (gen_rtx_REG (SImode, regno),
++	      emit_move_insn (reg = gen_rtx_REG (SImode, regno),
+ 			      gen_frame_mem (SImode, x));
++	      if (regno == A0_REG && sibcall_p)
++		emit_use (reg);
+ 	    }
+ 	}
+ 
+@@ -3425,7 +3450,8 @@ xtensa_expand_epilogue (void)
+ 				  EH_RETURN_STACKADJ_RTX));
+     }
+   cfun->machine->epilogue_done = true;
+-  emit_jump_insn (gen_return ());
++  if (!sibcall_p)
++    emit_jump_insn (gen_return ());
+ }
+ 
+ bool
+@@ -4944,4 +4970,20 @@ xtensa_asan_shadow_offset (void)
+   return HOST_WIDE_INT_UC (0x10000000);
+ }
+ 
++/* Implement TARGET_FUNCTION_OK_FOR_SIBCALL.  */
++static bool
++xtensa_function_ok_for_sibcall (tree decl, tree exp ATTRIBUTE_UNUSED)
++{
++  /* Do not allow tailcalls if the Windowed Register Option is
++     configured.  */
++  if (TARGET_WINDOWED_ABI)
++    return false;
++
++  /* Do not allow indirect tailcalls.  */
++  if (decl == NULL)
++    return false;
++
++  return true;
++}
++
+ #include "gt-xtensa.h"
+diff --git a/gcc/config/xtensa/xtensa.md b/gcc/config/xtensa/xtensa.md
+index ac2039b0e..fe4589ab6 100644
+--- a/gcc/config/xtensa/xtensa.md
++++ b/gcc/config/xtensa/xtensa.md
+@@ -2052,11 +2052,11 @@
+ (define_insn_and_split "call_internal"
+   [(call (mem (match_operand:SI 0 "call_insn_operand" "nir"))
+ 	 (match_operand 1 "" "i"))]
+-  ""
++  "!SIBLING_CALL_P (insn)"
+ {
+   return xtensa_emit_call (0, operands);
+ }
+-  "xtensa_split_longcalls_p (operands[0])"
++  "&& xtensa_split_longcalls_p (operands[0])"
+   [(set (reg:SI A0_REG)
+ 	(match_dup 0))
+    (call (mem:SI (reg:SI A0_REG))
+@@ -2096,11 +2096,11 @@
+   [(set (match_operand 0 "register_operand" "=a")
+         (call (mem (match_operand:SI 1 "call_insn_operand" "nir"))
+               (match_operand 2 "" "i")))]
+-  ""
++  "!SIBLING_CALL_P (insn)"
+ {
+   return xtensa_emit_call (1, operands);
+ }
+-  "xtensa_split_longcalls_p (operands[1])"
++  "&& xtensa_split_longcalls_p (operands[1])"
+   [(set (reg:SI A0_REG)
+ 	(match_dup 1))
+    (set (match_dup 0)
+@@ -2130,6 +2130,67 @@
+ 	(call (mem:SI (reg:SI A0_REG))
+ 	      (match_dup 4)))])
+ 
++(define_expand "sibcall"
++  [(call (match_operand 0 "memory_operand" "")
++	 (match_operand 1 "" ""))]
++  "!TARGET_WINDOWED_ABI"
++{
++  xtensa_prepare_expand_call (0, operands);
++})
++
++(define_insn_and_split "sibcall_internal"
++  [(call (mem:SI (match_operand:SI 0 "call_insn_operand" "nir"))
++	 (match_operand 1 "" "i"))]
++  "!TARGET_WINDOWED_ABI && SIBLING_CALL_P (insn)"
++{
++  return xtensa_emit_sibcall (0, operands);
++}
++  "&& xtensa_split_longcalls_p (operands[0])
++   && can_create_pseudo_p ()"
++  [(set (match_dup 2)
++	(match_dup 0))
++   (call (mem:SI (match_dup 2))
++	 (match_dup 1))]
++{
++  xtensa_prepare_split_longcalls (0, operands);
++  operands[2] = gen_reg_rtx (SImode);
++}
++  [(set_attr "type"	"call")
++   (set_attr "mode"	"none")
++   (set_attr "length"	"3")])
++
++(define_expand "sibcall_value"
++  [(set (match_operand 0 "register_operand" "")
++	(call (match_operand 1 "memory_operand" "")
++	      (match_operand 2 "" "")))]
++  "!TARGET_WINDOWED_ABI"
++{
++  xtensa_prepare_expand_call (1, operands);
++})
++
++(define_insn_and_split "sibcall_value_internal"
++  [(set (match_operand 0 "register_operand" "=a")
++	(call (mem:SI (match_operand:SI 1 "call_insn_operand" "nir"))
++	      (match_operand 2 "" "i")))]
++  "!TARGET_WINDOWED_ABI && SIBLING_CALL_P (insn)"
++{
++  return xtensa_emit_sibcall (1, operands);
++}
++  "&& xtensa_split_longcalls_p (operands[1])
++   && can_create_pseudo_p ()"
++  [(set (match_dup 3)
++	(match_dup 1))
++   (set (match_dup 0)
++	(call (mem:SI (match_dup 3))
++	      (match_dup 2)))]
++{
++  xtensa_prepare_split_longcalls (1, operands);
++  operands[3] = gen_reg_rtx (SImode);
++}
++  [(set_attr "type"	"call")
++   (set_attr "mode"	"none")
++   (set_attr "length"	"3")])
++
+ (define_insn "entry"
+   [(set (reg:SI A1_REG)
+ 	(unspec_volatile:SI [(match_operand:SI 0 "const_int_operand" "i")]
+@@ -2197,7 +2258,15 @@
+   [(return)]
+   ""
+ {
+-  xtensa_expand_epilogue ();
++  xtensa_expand_epilogue (false);
++  DONE;
++})
++
++(define_expand "sibcall_epilogue"
++  [(return)]
++  "!TARGET_WINDOWED_ABI"
++{
++  xtensa_expand_epilogue (true);
+   DONE;
+ })
+ 
+diff --git a/gcc/testsuite/gcc.target/xtensa/sibcalls.c b/gcc/testsuite/gcc.target/xtensa/sibcalls.c
+new file mode 100644
+index 000000000..ebc19ab02
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/xtensa/sibcalls.c
+@@ -0,0 +1,15 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -foptimize-sibling-calls" } */
++
++extern int foo(int);
++extern void bar(int);
++
++int test_0(int a) {
++    return foo(a);
++}
++
++void test_1(int a) {
++    bar(a);
++}
++
++/* { dg-final { scan-assembler-not "ret\.|ret$" } } */
+-- 
+2.20.1
+
