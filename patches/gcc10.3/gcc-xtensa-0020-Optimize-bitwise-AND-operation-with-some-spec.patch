@@ -1,0 +1,240 @@
+From 4b1e873f4e64e23855f299a13b845b9f335650af Mon Sep 17 00:00:00 2001
+From: Takayuki 'January June' Suwa <jjsuwa_sys3175@yahoo.co.jp>
+Date: Mon, 31 May 2021 12:48:56 +0900
+Subject: [PATCH 13/19] xtensa: Optimize bitwise AND operation with some
+ specific forms of constants
+
+This patch offers several insn-and-split patterns for bitwise AND with
+register and constant that cannot fit into a "MOVI Ax, simm12" instruction,
+but can be represented as:
+
+i.   1's least significant N bits and the others 0's (17 <= N <= 31)
+ii.  1's most significant N bits and the others 0's (12 <= N <= 31)
+iii. M 1's sequence of bits and trailing N 0's bits
+	(1 <= M <= 16, 1 <= N <= 30)
+
+And also offers shortcuts for conditional branch if each of the abovementioned
+operations is (not) equal to zero.
+
+gcc/ChangeLog:
+
+	* gcc/config/xtensa/predicates.md (shifted_mask_operand):
+	New predicate.
+	* gcc/config/xtensa/xtensa.md (*andsi3_const_pow2_minus_one):
+	New insn-and-split pattern.
+	(*andsi3_const_negative_pow2, *andsi3_const_shifted_mask,
+	*masktrue_const_pow2_minus_one, *masktrue_const_negative_pow2,
+	*masktrue_const_shifted_mask): Ditto.
+---
+ gcc/config/xtensa/predicates.md |  11 +++
+ gcc/config/xtensa/xtensa.md     | 165 ++++++++++++++++++++++++++++++++
+ 2 files changed, 176 insertions(+)
+
+diff --git a/gcc/config/xtensa/predicates.md b/gcc/config/xtensa/predicates.md
+index e7836f0ec..024c29416 100644
+--- a/gcc/config/xtensa/predicates.md
++++ b/gcc/config/xtensa/predicates.md
+@@ -52,6 +52,17 @@
+ 	    (match_test "xtensa_mask_immediate (INTVAL (op))"))
+        (match_operand 0 "register_operand")))
+ 
++(define_predicate "shifted_mask_operand"
++  (and (match_code "const_int")
++       (match_test "!xtensa_simm12b (INTVAL (op))"))
++{
++  HOST_WIDE_INT mask = INTVAL (op);
++  int shift = ctz_hwi (mask);
++
++  return IN_RANGE (shift, 1, 31)
++	 && xtensa_mask_immediate ((uint32_t)mask >> shift);
++})
++
+ (define_predicate "extui_fldsz_operand"
+   (and (match_code "const_int")
+        (match_test "IN_RANGE (INTVAL (op), 1, 16)")))
+diff --git a/gcc/config/xtensa/xtensa.md b/gcc/config/xtensa/xtensa.md
+index 677dc0485..b2c453ef8 100644
+--- a/gcc/config/xtensa/xtensa.md
++++ b/gcc/config/xtensa/xtensa.md
+@@ -587,6 +587,78 @@
+    (set_attr "mode"	"SI")
+    (set_attr "length"	"3,3")])
+ 
++(define_insn_and_split "*andsi3_const_pow2_minus_one"
++  [(set (match_operand:SI 0 "register_operand" "=a")
++	(and:SI (match_operand:SI 1 "register_operand" "r")
++		(match_operand:SI 2 "const_int_operand" "i")))]
++  "IN_RANGE (exact_log2 (INTVAL (operands[2]) + 1), 17, 31)"
++  "#"
++  "&& 1"
++  [(set (match_dup 0)
++	(ashift:SI (match_dup 1)
++		   (match_dup 2)))
++   (set (match_dup 0)
++	(lshiftrt:SI (match_dup 0)
++		     (match_dup 2)))]
++{
++  operands[2] = GEN_INT (32 - floor_log2 (INTVAL (operands[2]) + 1));
++}
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")
++   (set (attr "length")
++	(if_then_else (match_test "TARGET_DENSITY
++				   && INTVAL (operands[2]) == 0x7FFFFFFF")
++		      (const_int 5)
++		      (const_int 6)))])
++
++(define_insn_and_split "*andsi3_const_negative_pow2"
++  [(set (match_operand:SI 0 "register_operand" "=a")
++	(and:SI (match_operand:SI 1 "register_operand" "r")
++		(match_operand:SI 2 "const_int_operand" "i")))]
++  "IN_RANGE (exact_log2 (-INTVAL (operands[2])), 12, 31)"
++  "#"
++  "&& 1"
++  [(set (match_dup 0)
++	(lshiftrt:SI (match_dup 1)
++		     (match_dup 2)))
++   (set (match_dup 0)
++	(ashift:SI (match_dup 0)
++		   (match_dup 2)))]
++{
++  operands[2] = GEN_INT (floor_log2 (-INTVAL (operands[2])));
++}
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")
++   (set_attr "length"	"6")])
++
++(define_insn_and_split "*andsi3_const_shifted_mask"
++  [(set (match_operand:SI 0 "register_operand" "=a")
++	(and:SI (match_operand:SI 1 "register_operand" "r")
++		(match_operand:SI 2 "shifted_mask_operand" "i")))]
++  ""
++  "#"
++  ""
++  [(set (match_dup 0)
++	(zero_extract:SI (match_dup 1)
++			 (match_dup 3)
++			 (match_dup 2)))
++   (set (match_dup 0)
++	(ashift:SI (match_dup 0)
++		   (match_dup 2)))]
++{
++  HOST_WIDE_INT mask = INTVAL (operands[2]);
++  int shift = ctz_hwi (mask);
++  operands[2] = GEN_INT (shift);
++  operands[3] = GEN_INT (floor_log2 (((uint32_t)mask >> shift) + 1));
++}
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")
++   (set (attr "length")
++	(if_then_else (match_test "TARGET_DENSITY
++				   && ctz_hwi (INTVAL (operands[2])) == 1")
++		      (const_int 5)
++		      (const_int 6)))])
++
+ (define_insn "iorsi3"
+   [(set (match_operand:SI 0 "register_operand" "=a")
+ 	(ior:SI (match_operand:SI 1 "register_operand" "%r")
+@@ -1542,6 +1614,99 @@
+    (set_attr "mode"	"none")
+    (set_attr "length"	"3")])
+ 
++(define_insn_and_split "*masktrue_const_pow2_minus_one"
++  [(set (pc)
++	(if_then_else (match_operator 4 "boolean_operator"
++			[(zero_extract:SI (match_operand:SI 1 "register_operand" "r")
++					  (match_operand:SI 2 "const_int_operand" "i")
++					  (const_int 0))
++			 (const_int 0)])
++		      (label_ref (match_operand 3 "" ""))
++		      (pc)))
++   (clobber (match_scratch:SI 0 "=&a"))]
++  "IN_RANGE (INTVAL (operands[2]), 17, 31)"
++  "#"
++  "&& reload_completed"
++  [(set (match_dup 0)
++	(ashift:SI (match_dup 1)
++		   (match_dup 2)))
++   (set (pc)
++	(if_then_else (match_op_dup 4
++			[(match_dup 0)
++			 (const_int 0)])
++		      (label_ref (match_dup 3))
++		      (pc)))]
++{
++  operands[2] = GEN_INT (32 - INTVAL (operands[2]));
++}
++  [(set_attr "type"	"jump")
++   (set_attr "mode"	"none")
++   (set (attr "length")
++	(if_then_else (match_test "TARGET_DENSITY
++				   && INTVAL (operands[2]) == 31")
++		      (const_int 5)
++		      (const_int 6)))])
++
++(define_insn_and_split "*masktrue_const_negative_pow2"
++  [(set (pc)
++	(if_then_else (match_operator 4 "boolean_operator"
++			[(and:SI (match_operand:SI 1 "register_operand" "r")
++				 (match_operand:SI 2 "const_int_operand" "i"))
++			 (const_int 0)])
++		      (label_ref (match_operand 3 "" ""))
++		      (pc)))
++   (clobber (match_scratch:SI 0 "=&a"))]
++  "IN_RANGE (exact_log2 (-INTVAL (operands[2])), 12, 30)"
++  "#"
++  "&& reload_completed"
++  [(set (match_dup 0)
++	(lshiftrt:SI (match_dup 1)
++		     (match_dup 2)))
++   (set (pc)
++	(if_then_else (match_op_dup 4
++			[(match_dup 0)
++			 (const_int 0)])
++		      (label_ref (match_dup 3))
++		      (pc)))]
++{
++  operands[2] = GEN_INT (floor_log2 (-INTVAL (operands[2])));
++}
++  [(set_attr "type"	"jump")
++   (set_attr "mode"	"none")
++   (set_attr "length"	"6")])
++
++(define_insn_and_split "*masktrue_const_shifted_mask"
++  [(set (pc)
++	(if_then_else (match_operator 4 "boolean_operator"
++			[(and:SI (match_operand:SI 1 "register_operand" "r")
++				 (match_operand:SI 2 "shifted_mask_operand" "i"))
++			 (const_int 0)])
++		      (label_ref (match_operand 3 "" ""))
++		      (pc)))
++   (clobber (match_scratch:SI 0 "=&a"))]
++  ""
++  "#"
++  "reload_completed"
++  [(set (match_dup 0)
++	(zero_extract:SI (match_dup 1)
++			 (match_dup 5)
++			 (match_dup 2)))
++   (set (pc)
++	(if_then_else (match_op_dup 4
++			[(match_dup 0)
++			 (const_int 0)])
++		      (label_ref (match_dup 3))
++		      (pc)))]
++{
++  HOST_WIDE_INT mask = INTVAL (operands[2]);
++  int shift = ctz_hwi (mask);
++  operands[2] = GEN_INT (shift);
++  operands[5] = GEN_INT (floor_log2 (((uint32_t)mask >> shift) + 1));
++}
++  [(set_attr "type"	"jump")
++   (set_attr "mode"	"none")
++   (set_attr "length"	"6")])
++
+ 
+ ;; Zero-overhead looping support.
+ 
+-- 
+2.20.1
+
