@@ -1,0 +1,89 @@
+From c96618d1e2f58c2acf5690db18693acaa42d2376 Mon Sep 17 00:00:00 2001
+From: Takayuki 'January June' Suwa <jjsuwa_sys3175@yahoo.co.jp>
+Date: Sun, 8 May 2022 19:54:54 +0900
+Subject: [PATCH 19/19] xtensa: Add 32/64-bit float constant synthesis
+
+This patch introduces 32/64bit float constant synthesis that tries to avoid
+the use of L32R instrunction (and corresponding litpool entry), in the same
+way as 32-bit integer one.
+
+gcc/ChangeLog:
+
+	* gcc/config/xtensa/xtensa.md (): New split pattern.
+
+gcc/testsuite/ChangeLog:
+
+	* gcc.target/xtensa/constsynth_float.c: New.
+---
+ gcc/config/xtensa/xtensa.md                   | 37 +++++++++++++++++++
+ .../gcc.target/xtensa/constsynth_float.c      | 10 +++++
+ 2 files changed, 47 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/xtensa/constsynth_float.c
+
+diff --git a/gcc/config/xtensa/xtensa.md b/gcc/config/xtensa/xtensa.md
+index ca7287082..abb249427 100644
+--- a/gcc/config/xtensa/xtensa.md
++++ b/gcc/config/xtensa/xtensa.md
+@@ -1177,6 +1177,43 @@
+    (set_attr "mode"	"SF")
+    (set_attr "length"	"3")])
+ 
++(define_split
++  [(set (match_operand:SF 0 "register_operand")
++	(match_operand:SF 1 "constantpool_operand"))]
++  "reload_completed"
++  [(const_int 0)]
++{
++  int i = 0;
++  rtx x = XEXP (operands[1], 0);
++  long l[2];
++  gcc_assert (GP_REG_P (REGNO (operands[0])));
++  if (GET_CODE (x) == SYMBOL_REF
++      && CONSTANT_POOL_ADDRESS_P (x))
++    x = get_pool_constant (x);
++  else if (GET_CODE (x) == CONST)
++    {
++      x = XEXP (x, 0);
++      gcc_assert (GET_CODE (x) == PLUS
++		  && GET_CODE (XEXP (x, 0)) == SYMBOL_REF
++		  && CONSTANT_POOL_ADDRESS_P (XEXP (x, 0))
++		  && CONST_INT_P (XEXP (x, 1)));
++      i = INTVAL (XEXP (x, 1)) / 4;
++      gcc_assert (i <= 1);
++      x = get_pool_constant (XEXP (x, 0));
++    }
++  else
++    gcc_unreachable ();
++  if (GET_MODE (x) == SFmode)
++    REAL_VALUE_TO_TARGET_SINGLE (*CONST_DOUBLE_REAL_VALUE (x), l[0]);
++  else if (GET_MODE (x) == DFmode)
++    REAL_VALUE_TO_TARGET_DOUBLE (*CONST_DOUBLE_REAL_VALUE (x), l);
++  else
++    gcc_unreachable ();
++  emit_move_insn (gen_rtx_REG (SImode, REGNO (operands[0])),
++		  GEN_INT (l[i]));
++  DONE;
++})
++
+ ;; 64-bit floating point moves
+ 
+ (define_expand "movdf"
+diff --git a/gcc/testsuite/gcc.target/xtensa/constsynth_float.c b/gcc/testsuite/gcc.target/xtensa/constsynth_float.c
+new file mode 100644
+index 000000000..10c011566
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/xtensa/constsynth_float.c
+@@ -0,0 +1,10 @@
++/* { dg-do compile } */
++/* { dg-options "-Os } */
++
++double test(float* p)
++{
++  *p = 1.0f;
++  return -0.0;
++}
++
++/* { dg-final { scan-assembler-not "l32r" } } */
+-- 
+2.20.1
+
