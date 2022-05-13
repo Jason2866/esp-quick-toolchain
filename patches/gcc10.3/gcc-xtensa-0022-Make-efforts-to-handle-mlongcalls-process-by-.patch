@@ -1,0 +1,278 @@
+From 86774ac5770ac64db1dc2bd375733f2861313d7b Mon Sep 17 00:00:00 2001
+From: Takayuki 'January June' Suwa <jjsuwa_sys3175@yahoo.co.jp>
+Date: Mon, 31 Jan 2022 18:02:32 +0900
+Subject: [PATCH 15/19] xtensa: Make efforts to handle '-mlongcalls' process by
+ GCC itself
+
+This patch offers more insn scheduling opportunities, which is between each
+"L32R A0, <callee address in litpool>" and followed by "CALLXn A0" that stalls
+one clock cycle if adjacent.
+
+Litpool entry deduplication can also be offered (the assembler blindly appends
+callee entries).
+
+gcc/ChangeLog:
+
+	* gcc/config/xtensa/xtensa-protos.h (xtensa_prepare_expand_call,
+	xtensa_split_longcalls_p, xtensa_prepare_split_longcalls):
+	New prototypes.
+	* gcc/config/xtensa/xtensa.c (xtensa_prepare_expand_call):
+	New function in order to share the common code.
+	(xtensa_split_longcalls_p, xtensa_prepare_split_longcalls):
+	Ditto.
+	* gcc/config/xtensa/xtensa.md (call): Use xtensa_prepare_expand_call.
+	(call_value): Ditto.
+	(cal_internal): Add split condition, template and preparation code.
+	(call_value_internal): Ditto.
+	(): Add 2 peephole2 patterns, so that the two instructions pull
+	away from each other once again.
+
+gcc/testsuite/ChangeLog:
+
+	* gcc.target/xtensa/self-mlongcall.c: New.
+---
+ gcc/config/xtensa/xtensa-protos.h             |  4 ++
+ gcc/config/xtensa/xtensa.c                    | 46 +++++++++++++
+ gcc/config/xtensa/xtensa.md                   | 67 +++++++++++++++----
+ .../gcc.target/xtensa/self-mlongcall.c        | 40 +++++++++++
+ 4 files changed, 143 insertions(+), 14 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/xtensa/self-mlongcall.c
+
+diff --git a/gcc/config/xtensa/xtensa-protos.h b/gcc/config/xtensa/xtensa-protos.h
+index 56a0b7c3d..ce32f1fb3 100644
+--- a/gcc/config/xtensa/xtensa-protos.h
++++ b/gcc/config/xtensa/xtensa-protos.h
+@@ -52,7 +52,11 @@ extern void xtensa_expand_atomic (enum rtx_code, rtx, rtx, rtx, bool);
+ extern void xtensa_emit_loop_end (rtx_insn *, rtx *);
+ extern char *xtensa_emit_branch (bool, rtx *);
+ extern char *xtensa_emit_movcc (bool, bool, bool, rtx *);
++extern void xtensa_prepare_expand_call (int, rtx *);
+ extern char *xtensa_emit_call (int, rtx *);
++extern bool xtensa_split_longcalls_p (rtx);
++extern void xtensa_prepare_split_longcalls (int, rtx *);
++extern bool xtensa_peep2_longcalls_p (rtx *);
+ extern bool xtensa_tls_referenced_p (rtx);
+ extern enum rtx_code xtensa_shlrd_which_direction (rtx, rtx);
+ 
+diff --git a/gcc/config/xtensa/xtensa.c b/gcc/config/xtensa/xtensa.c
+index cb1de493b..93cd52a2d 100644
+--- a/gcc/config/xtensa/xtensa.c
++++ b/gcc/config/xtensa/xtensa.c
+@@ -2119,6 +2119,20 @@ xtensa_emit_movcc (bool inverted, bool isfp, bool isbool, rtx *operands)
+ }
+ 
+ 
++void
++xtensa_prepare_expand_call (int callop, rtx *operands)
++{
++  rtx addr = XEXP (operands[callop], 0);
++
++  if (flag_pic && SYMBOL_REF_P (addr)
++      && (!SYMBOL_REF_LOCAL_P (addr) || SYMBOL_REF_EXTERNAL_P (addr)))
++    addr = gen_sym_PLT (addr);
++
++  if (!call_insn_operand (addr, VOIDmode))
++    XEXP (operands[callop], 0) = copy_to_mode_reg (Pmode, addr);
++}
++
++
+ char *
+ xtensa_emit_call (int callop, rtx *operands)
+ {
+@@ -2137,6 +2151,38 @@ xtensa_emit_call (int callop, rtx *operands)
+ }
+ 
+ 
++bool
++xtensa_split_longcalls_p (rtx callee)
++{
++  return TARGET_L32R && TARGET_LONGCALLS
++	 && ((SYMBOL_REF_P (callee) && SYMBOL_REF_EXTERNAL_P (callee))
++	     || CONST_INT_P (callee));
++}
++
++
++void
++xtensa_prepare_split_longcalls (int callop, rtx *operands)
++{
++  if (!CONST_INT_P (operands[callop])
++      || !xtensa_simm12b (INTVAL (operands[callop])))
++    operands[callop] = force_const_mem (Pmode, operands[callop]);
++}
++
++
++bool
++xtensa_peep2_longcalls_p (rtx *operands)
++{
++  return TARGET_L32R && TARGET_LONGCALLS
++	 && (! REG_P (operands[0]) || REGNO (operands[0]) != A0_REG)
++	 && GET_CODE (operands[0]) != PC
++	 && GET_CODE (operands[1]) != CALL
++	 && GET_CODE (operands[1]) != ASM_OPERANDS
++	 && GET_CODE (operands[1]) != UNSPEC
++	 && GET_CODE (operands[1]) != UNSPEC_VOLATILE
++	 && CONSTANT_POOL_ADDRESS_P (XEXP (operands[2], 0));
++}
++
++
+ bool
+ xtensa_legitimate_address_p (machine_mode mode, rtx addr, bool strict)
+ {
+diff --git a/gcc/config/xtensa/xtensa.md b/gcc/config/xtensa/xtensa.md
+index dfc79b51d..ac2039b0e 100644
+--- a/gcc/config/xtensa/xtensa.md
++++ b/gcc/config/xtensa/xtensa.md
+@@ -2046,51 +2046,90 @@
+ 	 (match_operand 1 "" ""))]
+   ""
+ {
+-  rtx addr = XEXP (operands[0], 0);
+-  if (flag_pic && GET_CODE (addr) == SYMBOL_REF
+-      && (!SYMBOL_REF_LOCAL_P (addr) || SYMBOL_REF_EXTERNAL_P (addr)))
+-    addr = gen_sym_PLT (addr);
+-  if (!call_insn_operand (addr, VOIDmode))
+-    XEXP (operands[0], 0) = copy_to_mode_reg (Pmode, addr);
++  xtensa_prepare_expand_call (0, operands);
+ })
+ 
+-(define_insn "call_internal"
++(define_insn_and_split "call_internal"
+   [(call (mem (match_operand:SI 0 "call_insn_operand" "nir"))
+ 	 (match_operand 1 "" "i"))]
+   ""
+ {
+   return xtensa_emit_call (0, operands);
++}
++  "xtensa_split_longcalls_p (operands[0])"
++  [(set (reg:SI A0_REG)
++	(match_dup 0))
++   (call (mem:SI (reg:SI A0_REG))
++	 (match_dup 1))]
++{
++  xtensa_prepare_split_longcalls (0, operands);
+ }
+   [(set_attr "type"	"call")
+    (set_attr "mode"	"none")
+    (set_attr "length"	"3")])
+ 
++(define_peephole2
++  [(set (match_operand 0 "")
++	(match_operand 1 ""))
++   (set (reg:SI A0_REG)
++	(match_operand 2 "memory_operand"))
++   (call (mem:SI (reg:SI A0_REG))
++	 (match_operand 3 "const_int_operand"))]
++  "xtensa_peep2_longcalls_p (operands)"
++  [(set (reg:SI A0_REG)
++	(match_dup 2))
++   (set (match_dup 0)
++	(match_dup 1))
++   (call (mem:SI (reg:SI A0_REG))
++	 (match_dup 3))])
++
+ (define_expand "call_value"
+   [(set (match_operand 0 "register_operand" "")
+ 	(call (match_operand 1 "memory_operand" "")
+ 	      (match_operand 2 "" "")))]
+   ""
+ {
+-  rtx addr = XEXP (operands[1], 0);
+-  if (flag_pic && GET_CODE (addr) == SYMBOL_REF
+-      && (!SYMBOL_REF_LOCAL_P (addr) || SYMBOL_REF_EXTERNAL_P (addr)))
+-    addr = gen_sym_PLT (addr);
+-  if (!call_insn_operand (addr, VOIDmode))
+-    XEXP (operands[1], 0) = copy_to_mode_reg (Pmode, addr);
++  xtensa_prepare_expand_call (1, operands);
+ })
+ 
+-(define_insn "call_value_internal"
++(define_insn_and_split "call_value_internal"
+   [(set (match_operand 0 "register_operand" "=a")
+         (call (mem (match_operand:SI 1 "call_insn_operand" "nir"))
+               (match_operand 2 "" "i")))]
+   ""
+ {
+   return xtensa_emit_call (1, operands);
++}
++  "xtensa_split_longcalls_p (operands[1])"
++  [(set (reg:SI A0_REG)
++	(match_dup 1))
++   (set (match_dup 0)
++	(call (mem:SI (reg:SI A0_REG))
++	      (match_dup 2)))]
++{
++  xtensa_prepare_split_longcalls (1, operands);
+ }
+   [(set_attr "type"	"call")
+    (set_attr "mode"	"none")
+    (set_attr "length"	"3")])
+ 
++(define_peephole2
++  [(set (match_operand 0 "")
++	(match_operand 1 ""))
++   (set (reg:SI A0_REG)
++	(match_operand 2 "memory_operand"))
++   (set (match_operand 3 "register_operand")
++	(call (mem:SI (reg:SI A0_REG))
++	      (match_operand 4 "const_int_operand")))]
++  "xtensa_peep2_longcalls_p (operands)"
++  [(set (reg:SI A0_REG)
++	(match_dup 2))
++   (set (match_dup 0)
++	(match_dup 1))
++   (set (match_dup 3)
++	(call (mem:SI (reg:SI A0_REG))
++	      (match_dup 4)))])
++
+ (define_insn "entry"
+   [(set (reg:SI A1_REG)
+ 	(unspec_volatile:SI [(match_operand:SI 0 "const_int_operand" "i")]
+diff --git a/gcc/testsuite/gcc.target/xtensa/self-mlongcall.c b/gcc/testsuite/gcc.target/xtensa/self-mlongcall.c
+new file mode 100644
+index 000000000..cfc07ecbe
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/xtensa/self-mlongcall.c
+@@ -0,0 +1,40 @@
++/* { dg-do compile } */
++/* { dg-options "-O2 -mlongcalls -fno-optimize-sibling-calls" } */
++
++extern void foo(int);
++extern int bar(int);
++
++int __attribute__((noinline)) baz(int a)
++{
++  return bar(bar(bar(a)));
++}
++
++void test_0(int a)
++{
++  foo(a);
++}
++
++int test_1(int a)
++{
++  return bar(a * 9);
++}
++
++int test_2(int a)
++{
++  return baz(a + 1);
++}
++
++int test_3(void)
++{
++  ((int(*)(void))0xdeadbeef)();
++}
++
++void test_4(void)
++{
++  ((void(*)(void))0x0)();
++}
++
++/* { dg-final { scan-assembler-times ".literal .LC" 4 } } */
++/* { dg-final { scan-assembler-times "l32r" 6 } } */
++/* { dg-final { scan-assembler-times "callx" 7 } } */
++/* { dg-final { scan-assembler-times "call\[01248\]+" 1 } } */
+-- 
+2.20.1
+
