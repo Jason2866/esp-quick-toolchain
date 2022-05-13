@@ -1,0 +1,69 @@
+From ca5ac7ac3f706de30986c176956e48fe23cf4ca4 Mon Sep 17 00:00:00 2001
+From: Takayuki 'January June' Suwa <jjsuwa_sys3175@yahoo.co.jp>
+Date: Mon, 31 May 2021 19:43:28 +0900
+Subject: [PATCH 14/19] xtensa: Optimize '(~x & y)' to '((x & y) ^ y)'
+
+In Xtensa ISA, there is no single machine instruction that performs unary
+bitwise negation.
+
+gcc/ChangeLog:
+
+	* gcc/config/xtensa/xtensa.md (*andsi3_bitcmpl): New insn pattern.
+
+gcc/testsuite/ChangeLog:
+
+	* gcc.target/xtensa/checkZeroByte.c: New.
+---
+ gcc/config/xtensa/xtensa.md                   | 19 +++++++++++++++++++
+ .../gcc.target/xtensa/checkZeroByte.c         |  9 +++++++++
+ 2 files changed, 28 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/xtensa/checkZeroByte.c
+
+diff --git a/gcc/config/xtensa/xtensa.md b/gcc/config/xtensa/xtensa.md
+index b2c453ef8..dfc79b51d 100644
+--- a/gcc/config/xtensa/xtensa.md
++++ b/gcc/config/xtensa/xtensa.md
+@@ -659,6 +659,25 @@
+ 		      (const_int 5)
+ 		      (const_int 6)))])
+ 
++(define_insn_and_split "*andsi3_bitcmpl"
++  [(set (match_operand:SI 0 "register_operand" "=a")
++	(and:SI (not:SI (match_operand:SI 1 "register_operand" "r"))
++		(match_operand:SI 2 "register_operand" "r")))
++   (clobber (match_scratch:SI 3 "=&a"))]
++  ""
++  "#"
++  "reload_completed"
++  [(set (match_dup 3)
++	(and:SI (match_dup 1)
++		(match_dup 2)))
++   (set (match_dup 0)
++	(xor:SI (match_dup 3)
++		(match_dup 2)))]
++  ""
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")
++   (set_attr "length"	"6")])
++
+ (define_insn "iorsi3"
+   [(set (match_operand:SI 0 "register_operand" "=a")
+ 	(ior:SI (match_operand:SI 1 "register_operand" "%r")
+diff --git a/gcc/testsuite/gcc.target/xtensa/checkZeroByte.c b/gcc/testsuite/gcc.target/xtensa/checkZeroByte.c
+new file mode 100644
+index 000000000..fa2a7c332
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/xtensa/checkZeroByte.c
+@@ -0,0 +1,9 @@
++/* { dg-do compile } */
++/* { dg-options "-O" } */
++
++int checkZeroByte(int v)
++{
++  return (v - 0x01010101) & ~v & 0x80808080;
++}
++
++/* { dg-final { scan-assembler-not "movi" } } */
+-- 
+2.20.1
+
